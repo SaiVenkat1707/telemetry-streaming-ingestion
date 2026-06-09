@@ -1,0 +1,4 @@
+ai/conexio/vehicle/consumer/ValkeyConfig.class
+ai/conexio/vehicle/consumer/ConsumerMain.class
+ai/conexio/vehicle/consumer/IamRedisCredentialsProvider.class
+ai/conexio/vehicle/consumer/IamAuthTokenGenerator.class

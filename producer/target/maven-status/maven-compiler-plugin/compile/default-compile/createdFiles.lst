@@ -1,0 +1,4 @@
+ai/conexio/vehicle/producer/ValkeyConfig.class
+ai/conexio/vehicle/producer/ProducerMain.class
+ai/conexio/vehicle/producer/IamAuthTokenGenerator.class
+ai/conexio/vehicle/producer/IamRedisCredentialsProvider.class
