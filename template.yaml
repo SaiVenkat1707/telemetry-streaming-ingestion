@@ -1,0 +1,377 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Vehicle stream prototype — ECR, MemoryDB (Valkey), IAM, ECS Fargate producer/consumer.
+  Equivalent to PHASE2-CONSOLE-GUIDE.md. Push Docker images after stack create (see deploy.ps1).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: vehicle
+    Description: Prefix for resource names (cluster, services, security groups).
+    AllowedPattern: "[a-z][a-z0-9-]*"
+    ConstraintDescription: Lowercase letters, numbers, and hyphens; must start with a letter.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for MemoryDB and Fargate tasks (default VPC is fine).
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in different AZs (public subnets if using AssignPublicIp).
+
+  MemoryDBClusterName:
+    Type: String
+    Default: vehicle-memorydb
+    Description: MemoryDB cluster name — also used as VALKEY_CLUSTER_NAME for IAM token signing.
+    AllowedPattern: "[a-z][a-z0-9-]*"
+
+  MemoryDBUserName:
+    Type: String
+    Default: vehicle-app
+    Description: MemoryDB IAM user — also used as VALKEY_USER in containers.
+
+  MemoryDBNodeType:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.small
+      - db.t4g.medium
+      - db.r7g.large
+
+  MemoryDBEngineVersion:
+    Type: String
+    Default: "7.3"
+    Description: Valkey engine version (IAM auth requires >= 7.0).
+
+  ImageTag:
+    Type: String
+    Default: latest
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Desired task count per ECS service (set 0 to pause without deleting the stack).
+
+  StreamKey:
+    Type: String
+    Default: vehicle:vin-events
+
+Resources:
+  # --- ECR ---
+  ConsumerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-consumer"
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      EmptyOnDelete: true
+
+  ProducerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-producer"
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      EmptyOnDelete: true
+
+  # --- Security groups ---
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate vehicle services
+      GroupName: !Sub "${ProjectName}-app-sg"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  MemoryDBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MemoryDB access from vehicle app tasks
+      GroupName: !Sub "${ProjectName}-memorydb-sg"
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  MemoryDBSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MemoryDBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  # --- MemoryDB ---
+  MemoryDBSubnetGroup:
+    Type: AWS::MemoryDB::SubnetGroup
+    Properties:
+      SubnetGroupName: !Sub "${ProjectName}-subnet-group"
+      Description: Subnets for vehicle MemoryDB cluster
+      SubnetIds: !Ref SubnetIds
+
+  MemoryDBUser:
+    Type: AWS::MemoryDB::User
+    Properties:
+      UserName: !Ref MemoryDBUserName
+      AccessString: "on ~* +@all"
+      AuthenticationMode:
+        Type: iam
+
+  MemoryDBACL:
+    Type: AWS::MemoryDB::ACL
+    DependsOn: MemoryDBUser
+    Properties:
+      ACLName: !Sub "${ProjectName}-acl"
+      UserNames:
+        - !Ref MemoryDBUser
+
+  MemoryDBCluster:
+    Type: AWS::MemoryDB::Cluster
+    DependsOn:
+      - MemoryDBACL
+      - MemoryDBSubnetGroup
+      - MemoryDBSecurityGroupIngress
+    Properties:
+      ClusterName: !Ref MemoryDBClusterName
+      Description: Valkey cluster for vehicle stream prototype
+      Engine: valkey
+      EngineVersion: !Ref MemoryDBEngineVersion
+      NodeType: !Ref MemoryDBNodeType
+      NumShards: 1
+      NumReplicasPerShard: 0
+      Port: 6379
+      TLSEnabled: true
+      ACLName: !Ref MemoryDBACL
+      SubnetGroupName: !Ref MemoryDBSubnetGroup
+      SecurityGroupIds:
+        - !Ref MemoryDBSecurityGroup
+      SnapshotRetentionLimit: 0
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- IAM ---
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: memorydb-connect
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: memorydb:connect
+                Resource:
+                  - !Sub "arn:aws:memorydb:${AWS::Region}:${AWS::AccountId}:cluster/${MemoryDBClusterName}"
+                  - !Sub "arn:aws:memorydb:${AWS::Region}:${AWS::AccountId}:user/${MemoryDBUserName}"
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-ecs-execution-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # --- CloudWatch ---
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}"
+      RetentionInDays: 7
+
+  # --- ECS ---
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+
+  ConsumerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: MemoryDBCluster
+    Properties:
+      Family: !Sub "${ProjectName}-consumer"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: consumer
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-consumer:${ImageTag}"
+          Essential: true
+          Environment:
+            - Name: VALKEY_HOST
+              Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+            - Name: VALKEY_PORT
+              Value: "6379"
+            - Name: VALKEY_TLS
+              Value: "true"
+            - Name: VALKEY_AUTH_MODE
+              Value: iam
+            - Name: VALKEY_USER
+              Value: !Ref MemoryDBUserName
+            - Name: VALKEY_CLUSTER_NAME
+              Value: !Ref MemoryDBClusterName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: STREAM_KEY
+              Value: !Ref StreamKey
+            - Name: BLOCK_MS
+              Value: "5000"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: consumer
+
+  ProducerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: MemoryDBCluster
+    Properties:
+      Family: !Sub "${ProjectName}-producer"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: producer
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-producer:${ImageTag}"
+          Essential: true
+          Environment:
+            - Name: VALKEY_HOST
+              Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+            - Name: VALKEY_PORT
+              Value: "6379"
+            - Name: VALKEY_TLS
+              Value: "true"
+            - Name: VALKEY_AUTH_MODE
+              Value: iam
+            - Name: VALKEY_USER
+              Value: !Ref MemoryDBUserName
+            - Name: VALKEY_CLUSTER_NAME
+              Value: !Ref MemoryDBClusterName
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: STREAM_KEY
+              Value: !Ref StreamKey
+            - Name: PRODUCE_INTERVAL_MS
+              Value: "2000"
+            - Name: SNAPSHOT_TTL_SECONDS
+              Value: "3600"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: producer
+
+  ConsumerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - MemoryDBCluster
+      - ConsumerTaskDefinition
+    Properties:
+      ServiceName: !Sub "${ProjectName}-consumer-svc"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ConsumerTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref AppSecurityGroup
+
+  ProducerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - MemoryDBCluster
+      - ProducerTaskDefinition
+    Properties:
+      ServiceName: !Sub "${ProjectName}-producer-svc"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ProducerTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref AppSecurityGroup
+
+Outputs:
+  StackRegion:
+    Description: Region this stack was deployed to
+    Value: !Ref AWS::Region
+
+  ConsumerRepositoryUri:
+    Description: ECR URI for the consumer image (build tag push target)
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-consumer"
+
+  ProducerRepositoryUri:
+    Description: ECR URI for the producer image (build tag push target)
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-producer"
+
+  MemoryDBClusterEndpoint:
+    Description: MemoryDB configuration endpoint (hostname only — wired into task defs automatically)
+    Value: !GetAtt MemoryDBCluster.ClusterEndpoint.Address
+
+  MemoryDBClusterName:
+    Description: Cluster name used for IAM token signing (VALKEY_CLUSTER_NAME)
+    Value: !Ref MemoryDBClusterName
+
+  CloudWatchLogGroup:
+    Description: Log group for producer and consumer output
+    Value: !Ref LogGroup
+
+  EcsClusterName:
+    Description: ECS cluster name
+    Value: !Ref EcsCluster
+
+  ConsumerServiceName:
+    Description: ECS service name for the consumer
+    Value: !Sub "${ProjectName}-consumer-svc"
+
+  ProducerServiceName:
+    Description: ECS service name for the producer
+    Value: !Sub "${ProjectName}-producer-svc"
+
+  DeployImagesHint:
+    Description: Run deploy.ps1 after stack create to build, push images, and roll ECS services
+    Value: !Sub ".\\cloudformation\\deploy.ps1 -StackName ${AWS::StackName} -Region ${AWS::Region}"
