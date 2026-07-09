@@ -33,7 +33,7 @@ Auth is **IAM-based** — no passwords. The task role grants `memorydb:connect`;
 One command provisions ECR, MemoryDB, IAM, ECS, and CloudWatch, then builds/pushes images and rolls the services:
 
 ```powershell
-.\cloudformation\deploy.ps1 -Region eu-central-1
+.\deploy.ps1 -Region eu-central-1
 ```
 
 Uses your account's **default VPC and subnets** automatically. Override with `-VpcId` and `-SubnetIds`.
@@ -42,10 +42,10 @@ First create takes **~5–10 minutes** (MemoryDB). Re-runs only push new images 
 
 ```powershell
 # Infra only (no docker build)
-.\cloudformation\deploy.ps1 -SkipImages
+.\deploy.ps1 -SkipImages
 
 # Re-push images after code changes (stack already exists)
-.\cloudformation\deploy.ps1 -SkipInfra
+.\deploy.ps1 -SkipInfra
 ```
 
 **Teardown** (stops billing):
@@ -54,7 +54,7 @@ First create takes **~5–10 minutes** (MemoryDB). Re-runs only push new images 
 aws cloudformation delete-stack --stack-name vehicle-stream --region eu-central-1
 ```
 
-Template: [`cloudformation/template.yaml`](./cloudformation/template.yaml)
+Template: [`template.yaml`](./template.yaml)
 
 ## Verify
 
@@ -80,10 +80,3 @@ Prefer clicking through the AWS Console? Same architecture, step by step:
 
 Java 21 · Lettuce · AWS MemoryDB (Valkey) · ECR · ECS Fargate · CloudWatch · IAM auth
 
-## Local development
-
-```bash
-docker compose up --build
-```
-
-Runs against a local Valkey container — no TLS, no IAM.
