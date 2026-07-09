@@ -23,63 +23,58 @@ Auth is **IAM-based** — no passwords. The task role grants `memorydb:connect`;
 
 ## Prerequisites
 
-- Docker (to build images)
-- AWS CLI authenticated to your account (`aws sts get-caller-identity`)
-- Permissions for ECR, ECS Fargate, MemoryDB, IAM, CloudWatch
+- Docker + AWS CLI authenticated to your account (`aws sts get-caller-identity`)
+- IAM permissions for CloudFormation, ECR, ECS, MemoryDB, VPC, IAM roles
 
-> MemoryDB `db.t4g.small` costs ~$50/month if left running. Tear down when done — see the guide's teardown section.
+> MemoryDB `db.t4g.small` costs ~$50/month if left running. Delete the stack when done.
 
-## Deploy overview
+## Deploy (CloudFormation)
 
-1. **ECR** — create `vehicle-consumer` and `vehicle-producer` repos; build and push images
-2. **MemoryDB** — single-shard Valkey ≥ 7.0 cluster, IAM user, ACL, security group on port 6379
-3. **IAM** — task role with `memorydb:connect` on the cluster and user
-4. **ECS** — Fargate cluster, task definitions for both services, services with public IP in the same VPC/subnets
-5. **CloudWatch** — log group `/ecs/vehicle`; consumer output appears here
+One command provisions ECR, MemoryDB, IAM, ECS, and CloudWatch, then builds/pushes images and rolls the services:
 
-Full click-by-click walkthrough (Console, task-definition JSON, troubleshooting, teardown):
-
-**[PHASE2-CONSOLE-GUIDE.md](./PHASE2-CONSOLE-GUIDE.md)**
-
-## Build and push to ECR
-
-```bash
-ACCOUNT_ID=<your-account-id>
-REGION=<your-region>          # e.g. eu-central-1
-ECR=$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com
-
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR
-
-docker build -t vehicle-consumer ./consumer
-docker build -t vehicle-producer ./producer
-docker tag vehicle-consumer:latest $ECR/vehicle-consumer:latest
-docker tag vehicle-producer:latest $ECR/vehicle-producer:latest
-docker push $ECR/vehicle-consumer:latest
-docker push $ECR/vehicle-producer:latest
+```powershell
+.\cloudformation\deploy.ps1 -Region eu-central-1
 ```
 
-## Required environment variables (AWS)
+Uses your account's **default VPC and subnets** automatically. Override with `-VpcId` and `-SubnetIds`.
 
-Set these on both ECS task definitions:
+First create takes **~5–10 minutes** (MemoryDB). Re-runs only push new images and restart tasks.
 
-| Variable | Value |
-|----------|-------|
-| `VALKEY_HOST` | MemoryDB cluster endpoint — **hostname only, no `:6379`** |
-| `VALKEY_PORT` | `6379` |
-| `VALKEY_TLS` | `true` |
-| `VALKEY_AUTH_MODE` | `iam` |
-| `VALKEY_USER` | MemoryDB user name (e.g. `vehicle-app`) |
-| `VALKEY_CLUSTER_NAME` | Cluster **name** for IAM signing — not the endpoint DNS |
-| `AWS_REGION` | Your region (Fargate may set this automatically) |
-| `STREAM_KEY` | `vehicle:vin-events` |
+```powershell
+# Infra only (no docker build)
+.\cloudformation\deploy.ps1 -SkipImages
+
+# Re-push images after code changes (stack already exists)
+.\cloudformation\deploy.ps1 -SkipInfra
+```
+
+**Teardown** (stops billing):
+
+```bash
+aws cloudformation delete-stack --stack-name vehicle-stream --region eu-central-1
+```
+
+Template: [`cloudformation/template.yaml`](./cloudformation/template.yaml)
 
 ## Verify
 
-ECS → both services at **1/1 running** → CloudWatch → `/ecs/vehicle` → **consumer** stream:
+After ECS tasks reach **RUNNING**, tail consumer logs:
+
+```bash
+aws logs tail /ecs/vehicle --follow --log-stream-names-prefix consumer --region eu-central-1
+```
+
+Expected output:
 
 ```
 Snapshot for 1HGBH41JXMN109186 (stream id ...): {"vin":"1HGBH41JXMN109186","speedKph":62.4,...}
 ```
+
+## Manual deploy (Console)
+
+Prefer clicking through the AWS Console? Same architecture, step by step:
+
+**[PHASE2-CONSOLE-GUIDE.md](./PHASE2-CONSOLE-GUIDE.md)**
 
 ## Stack
 
@@ -91,4 +86,4 @@ Java 21 · Lettuce · AWS MemoryDB (Valkey) · ECR · ECS Fargate · CloudWatch 
 docker compose up --build
 ```
 
-Runs against a local Valkey container — no TLS, no IAM. Useful for testing before pushing to AWS.
+Runs against a local Valkey container — no TLS, no IAM.
